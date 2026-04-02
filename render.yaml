@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: nifty-oi-dashboard
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120 DSS:app
+    envVars:
+      - key: KITE_API_KEY
+        sync: false
+      - key: KITE_ACCESS_TOKEN
+        sync: false
