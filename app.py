@@ -90,13 +90,13 @@ HIST_OTM_CACHE_KEY   = "otm"
 
 # ── IV storage ────────────────────────────────────────────
 # iv_history[strike] = {"ce": deque([{t, iv}, …]), "pe": deque([{t, iv}, …])}
-# We keep at most 300 raw snapshots per strike
+# Raw snapshots are maintained at 1-minute resolution using live LTP.
 IV_HISTORY_MAXLEN = 300
 iv_history: dict[int, dict] = {}   # populated during fetch_oi
 
 # ── Price + OI history for buildup signals ────────────────
 # price_oi_history[strike] = deque([{t, ce_ltp, pe_ltp, ce_oi, pe_oi}, …])
-# Same cadence as fetch_oi (every OI_INTERVAL seconds)
+# Maintained at 1-minute resolution using live LTP + latest known OI.
 price_oi_history: dict[int, deque] = {}   # populated during fetch_oi
 
 
@@ -189,21 +189,118 @@ def tte_years(expiry: date) -> float:
 def compute_ema(values: list, period: int = 9) -> list:
     """
     Returns EMA list of same length as values.
-    First <period> values are None (not enough data).
+    Uses a progressive EMA so higher timeframes still get a usable signal
+    even before a full 9 bars are available.
     """
-    if len(values) < period:
-        return [None] * len(values)
-    k   = 2.0 / (period + 1)
-    out = [None] * len(values)
-    # Seed with SMA of first `period` points
-    sma = sum(v for v in values[:period] if v is not None) / period
-    out[period - 1] = round(sma, 2)
-    for i in range(period, len(values)):
-        if values[i] is None or out[i - 1] is None:
-            out[i] = out[i - 1]
+    if not values:
+        return []
+    k = 2.0 / (period + 1)
+    out = []
+    ema = None
+    for value in values:
+        if value is None:
+            out.append(round(ema, 2) if ema is not None else None)
+            continue
+        if ema is None:
+            ema = float(value)
         else:
-            out[i] = round(values[i] * k + out[i - 1] * (1 - k), 2)
+            ema = (value * k) + (ema * (1 - k))
+        out.append(round(ema, 2))
     return out
+
+
+def _minute_label(ts: datetime | None = None) -> str:
+    if ts is None:
+        ts = datetime.now()
+    return ts.strftime("%d-%b %H:%M")
+
+
+def _parse_ts_label(ts_lbl: str) -> datetime | None:
+    for fmt in ("%d-%b %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            dt = datetime.strptime(ts_lbl, fmt)
+            if fmt == "%d-%b %H:%M":
+                return dt.replace(year=datetime.now().year)
+            return dt
+        except Exception:
+            continue
+    return None
+
+
+def _floor_ts_label(ts_lbl: str, tf_minutes: int) -> str | None:
+    dt = _parse_ts_label(ts_lbl)
+    if dt is None:
+        return None
+    floored_min = (dt.minute // tf_minutes) * tf_minutes
+    slot_dt = dt.replace(minute=floored_min, second=0, microsecond=0)
+    return slot_dt.strftime("%d-%b %H:%M")
+
+
+def _upsert_iv_point(strike: int, side: str, ts_lbl: str, iv_val: float | None):
+    if strike not in iv_history:
+        iv_history[strike] = {
+            "ce": deque(maxlen=IV_HISTORY_MAXLEN),
+            "pe": deque(maxlen=IV_HISTORY_MAXLEN),
+        }
+    buf = iv_history[strike][side]
+    if buf and buf[-1]["t"] == ts_lbl:
+        buf[-1]["iv"] = iv_val
+    else:
+        buf.append({"t": ts_lbl, "iv": iv_val})
+
+
+def _upsert_price_oi_point(strike: int, ts_lbl: str,
+                           ce_ltp: float, pe_ltp: float,
+                           ce_oi: int, pe_oi: int):
+    if strike not in price_oi_history:
+        price_oi_history[strike] = deque(maxlen=IV_HISTORY_MAXLEN)
+    poi_buf = price_oi_history[strike]
+    payload = {
+        "t": ts_lbl,
+        "ce_ltp": ce_ltp,
+        "pe_ltp": pe_ltp,
+        "ce_oi": ce_oi,
+        "pe_oi": pe_oi,
+    }
+    if poi_buf and poi_buf[-1]["t"] == ts_lbl:
+        poi_buf[-1].update(payload)
+    else:
+        poi_buf.append(payload)
+
+
+def update_live_iv_and_buildup_history(ts_lbl: str | None = None, spot: float | None = None):
+    """
+    Keep IV and price+OI history aligned to 1-minute bars using live LTP.
+    OI values are carried forward from the latest OI poll until the next poll.
+    """
+    rows = oi_data.get("rows", [])
+    expiry = _nearest_expiry
+    if not rows or expiry is None:
+        return
+
+    if ts_lbl is None:
+        ts_lbl = _minute_label()
+    if spot is None:
+        spot = ltp_data.get("NSE:NIFTY 50") or oi_data.get("spot")
+    if not spot:
+        return
+
+    T = tte_years(expiry)
+    for r in rows:
+        sk = int(r["strike"])
+        ce_sym = r.get("ce_sym")
+        pe_sym = r.get("pe_sym")
+        ce_ltp = ltp_data.get(ce_sym, r.get("ce_ltp") or 0)
+        pe_ltp = ltp_data.get(pe_sym, r.get("pe_ltp") or 0)
+        ce_oi = int(r.get("ce_oi") or 0)
+        pe_oi = int(r.get("pe_oi") or 0)
+
+        ce_iv = implied_vol(spot, sk, T, RISK_FREE, ce_ltp, "c") if ce_ltp > 0.01 else None
+        pe_iv = implied_vol(spot, sk, T, RISK_FREE, pe_ltp, "p") if pe_ltp > 0.01 else None
+
+        _upsert_iv_point(sk, "ce", ts_lbl, ce_iv)
+        _upsert_iv_point(sk, "pe", ts_lbl, pe_iv)
+        _upsert_price_oi_point(sk, ts_lbl, ce_ltp, pe_ltp, ce_oi, pe_oi)
 
 
 def resample_iv_history(strike: int, side: str, tf_minutes: int) -> list:
@@ -215,24 +312,15 @@ def resample_iv_history(strike: int, side: str, tf_minutes: int) -> list:
     if not raw:
         return []
 
-    if tf_minutes <= 1:
-        pts = list(raw)
-    else:
-        # Group by floored time slot
-        from collections import OrderedDict
-        buckets: dict = OrderedDict()
-        for pt in raw:
-            try:
-                dt = datetime.strptime(pt["t"], "%d-%b %H:%M")
-            except Exception:
-                continue
-            # Floor to tf_minutes
-            floored_min = (dt.minute // tf_minutes) * tf_minutes
-            slot_dt     = dt.replace(minute=floored_min, second=0)
-            slot_lbl    = slot_dt.strftime("%d-%b %H:%M")
-            buckets[slot_lbl] = pt["iv"]   # last-of-period IV
+    from collections import OrderedDict
+    buckets: dict = OrderedDict()
+    for pt in raw:
+        slot_lbl = pt["t"] if tf_minutes <= 1 else _floor_ts_label(pt["t"], tf_minutes)
+        if slot_lbl is None:
+            continue
+        buckets[slot_lbl] = pt["iv"]
 
-        pts = [{"t": t, "iv": iv} for t, iv in buckets.items()]
+    pts = [{"t": t, "iv": iv} for t, iv in buckets.items()]
 
     ivs  = [p["iv"] for p in pts]
     emas = compute_ema(ivs, 9)
@@ -249,20 +337,15 @@ def resample_price_oi(strike: int, tf_minutes: int) -> list:
     raw = price_oi_history.get(strike)
     if not raw:
         return []
-    if tf_minutes <= 1:
-        return list(raw)
     from collections import OrderedDict
     ce_buckets: dict = OrderedDict()
     pe_buckets: dict = OrderedDict()
     oi_ce_buckets: dict = OrderedDict()
     oi_pe_buckets: dict = OrderedDict()
     for pt in raw:
-        try:
-            dt = datetime.strptime(pt["t"], "%d-%b %H:%M")
-        except Exception:
+        slot_lbl = pt["t"] if tf_minutes <= 1 else _floor_ts_label(pt["t"], tf_minutes)
+        if slot_lbl is None:
             continue
-        floored_min = (dt.minute // tf_minutes) * tf_minutes
-        slot_lbl    = dt.replace(minute=floored_min, second=0).strftime("%d-%b %H:%M")
         ce_buckets[slot_lbl]    = pt["ce_ltp"]
         pe_buckets[slot_lbl]    = pt["pe_ltp"]
         oi_ce_buckets[slot_lbl] = pt["ce_oi"]
@@ -455,10 +538,10 @@ def _fetch_historical_for_strike(strike: int) -> dict:
     pe_raw = kite.historical_data(pe_tok, from_dt, to_dt, "3minute", oi=True)
     ts_map: dict[str, dict] = {}
     for c in ce_raw:
-        lbl = c["date"].strftime("%Y-%m-%d %H:%M")
+        lbl = c["date"].strftime("%d-%b %H:%M")
         ts_map.setdefault(lbl, {})["ce"] = c.get("oi", 0)
     for c in pe_raw:
-        lbl = c["date"].strftime("%Y-%m-%d %H:%M")
+        lbl = c["date"].strftime("%d-%b %H:%M")
         ts_map.setdefault(lbl, {})["pe"] = c.get("oi", 0)
     sorted_ts = sorted(ts_map.keys())
     return {"ts": sorted_ts,
@@ -487,15 +570,12 @@ def _fetch_historical_total() -> dict:
         except Exception as e:
             print(f"  [HIST-TOTAL] Failed for strike {strike}: {e}"); continue
         for c in ce_raw:
-            lbl = c["date"].strftime("%Y-%m-%d %H:%M")
+            lbl = c["date"].strftime("%d-%b %H:%M")
             ts_ce[lbl] = ts_ce.get(lbl, 0) + (c.get("oi") or 0)
         for c in pe_raw:
-            lbl = c["date"].strftime("%Y-%m-%d %H:%M")
+            lbl = c["date"].strftime("%d-%b %H:%M")
             ts_pe[lbl] = ts_pe.get(lbl, 0) + (c.get("oi") or 0)
-        all_ts = sorted(
-        set(ts_ce) | set(ts_pe),
-        key=lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M")
-        )
+    all_ts = sorted(set(ts_ce) | set(ts_pe))
     return {"ts": all_ts,
             "ce": [ts_ce.get(t, 0) for t in all_ts],
             "pe": [ts_pe.get(t, 0) for t in all_ts]}
@@ -525,16 +605,13 @@ def _fetch_historical_otm() -> dict:
             print(f"  [HIST-OTM] Failed for strike {strike}: {e}"); continue
         if offset > 0:
             for c in ce_raw:
-                lbl = c["date"].strftime("%Y-%m-%d %H:%M")
+                lbl = c["date"].strftime("%d-%b %H:%M")
                 ts_ce[lbl] = ts_ce.get(lbl, 0) + (c.get("oi") or 0)
         if offset < 0:
             for c in pe_raw:
-                lbl = c["date"].strftime("%Y-%m-%d %H:%M")
+                lbl = c["date"].strftime("%d-%b %H:%M")
                 ts_pe[lbl] = ts_pe.get(lbl, 0) + (c.get("oi") or 0)
-        all_ts = sorted(
-        set(ts_ce) | set(ts_pe),
-        key=lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M")
-        )
+    all_ts = sorted(set(ts_ce) | set(ts_pe))
     return {"ts": all_ts,
             "ce": [ts_ce.get(t, 0) for t in all_ts],
             "pe": [ts_pe.get(t, 0) for t in all_ts]}
@@ -552,10 +629,7 @@ def _merge_hist_total_with_live(hist: dict) -> dict:
             live_ts[t]["pe"] += pt["pe"]
     for t, v in live_ts.items():
         ts_map[t] = v
-    sorted_ts = sorted(
-    ts_map.keys(),
-    key=lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M")
-    )
+    sorted_ts = sorted(ts_map.keys())
     return {"ts": sorted_ts,
             "ce": [ts_map[t]["ce"] for t in sorted_ts],
             "pe": [ts_map[t]["pe"] for t in sorted_ts]}
@@ -565,10 +639,7 @@ def _merge_hist_with_live(strike: int, hist: dict) -> dict:
     ts_map = {t: {"ce": hist["ce"][i], "pe": hist["pe"][i]} for i, t in enumerate(hist["ts"])}
     for pt in oi_history.get(strike, []):
         ts_map[pt["t"]] = {"ce": pt["ce"], "pe": pt["pe"]}
-    sorted_ts = sorted(
-    ts_map.keys(),
-    key=lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M")
-    )
+    sorted_ts = sorted(ts_map.keys())
     return {"ts": sorted_ts,
             "ce": [ts_map[t]["ce"] for t in sorted_ts],
             "pe": [ts_map[t]["pe"] for t in sorted_ts]}
@@ -591,10 +662,7 @@ def _merge_hist_otm_with_live(hist: dict) -> dict:
                 live_ts[t]["pe"] += pt["pe"]
     for t, v in live_ts.items():
         ts_map[t] = v
-    sorted_ts = sorted(
-    ts_map.keys(),
-    key=lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M")
-    )
+    sorted_ts = sorted(ts_map.keys())
     return {"ts": sorted_ts,
             "ce": [ts_map[t]["ce"] for t in sorted_ts],
             "pe": [ts_map[t]["pe"] for t in sorted_ts]}
@@ -626,7 +694,7 @@ def fetch_oi():
         new_snap = {}
         result_rows = []
         total_ce = total_pe = 0
-        ts_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        ts_now = datetime.now().strftime("%d-%b %H:%M")
 
         for r in rows:
             ceq = quotes.get(r["ce_sym"], {})
@@ -651,34 +719,9 @@ def fetch_oi():
             if not oi_history[sk] or oi_history[sk][-1]["t"] != ts_now:
                 oi_history[sk].append({"t": ts_now, "ce": ce_oi, "pe": pe_oi})
 
-            # ── Compute IV using Black-Scholes ──────────────
+            # ── Compute current IV using Black-Scholes ──────
             ce_iv = implied_vol(spot, sk, T, RISK_FREE, ce_ltp, 'c') if ce_ltp > 0.01 else None
             pe_iv = implied_vol(spot, sk, T, RISK_FREE, pe_ltp, 'p') if pe_ltp > 0.01 else None
-
-            # Store IV history per strike
-            if sk not in iv_history:
-                iv_history[sk] = {
-                    "ce": deque(maxlen=IV_HISTORY_MAXLEN),
-                    "pe": deque(maxlen=IV_HISTORY_MAXLEN),
-                }
-            # Append or update last point if same timestamp
-            for side, iv_val in [("ce", ce_iv), ("pe", pe_iv)]:
-                buf = iv_history[sk][side]
-                if buf and buf[-1]["t"] == ts_now:
-                    buf[-1]["iv"] = iv_val
-                else:
-                    buf.append({"t": ts_now, "iv": iv_val})
-
-            # Store price + OI history for buildup signals
-            if sk not in price_oi_history:
-                price_oi_history[sk] = deque(maxlen=IV_HISTORY_MAXLEN)
-            poi_buf = price_oi_history[sk]
-            if poi_buf and poi_buf[-1]["t"] == ts_now:
-                poi_buf[-1].update({"ce_ltp": ce_ltp, "pe_ltp": pe_ltp,
-                                    "ce_oi": ce_oi, "pe_oi": pe_oi})
-            else:
-                poi_buf.append({"t": ts_now, "ce_ltp": ce_ltp, "pe_ltp": pe_ltp,
-                                "ce_oi": ce_oi, "pe_oi": pe_oi})
 
             result_rows.append({
                 "offset": r["offset"], "strike": r["strike"], "is_atm": r["is_atm"],
@@ -705,6 +748,7 @@ def fetch_oi():
         last_oi_time = datetime.now().strftime("%H:%M:%S")
         error_msg    = None
         ltp_symbols  = ["NSE:NIFTY 50"] + syms
+        update_live_iv_and_buildup_history(ts_lbl=ts_now, spot=spot)
         print(f"  [OI] ATM={atm}  Spot={spot:.2f}  PCR={pcr}  ts={ts_now}")
 
     except Exception as e:
@@ -730,6 +774,7 @@ def fetch_ltp():
         raw = kite.ltp(ltp_symbols)
         ltp_data = {sym: round(v.get("last_price") or 0, 2)
                     for sym, v in raw.items()}
+        update_live_iv_and_buildup_history()
     except Exception:
         pass
 
@@ -845,8 +890,8 @@ def api_iv():
             "offset":   r["offset"],
             "ce_sym":   r.get("ce_sym", ""),   # ← for live LTP update
             "pe_sym":   r.get("pe_sym", ""),
-            "ce_ltp":   r.get("ce_ltp"),
-            "pe_ltp":   r.get("pe_ltp"),
+            "ce_ltp":   ltp_data.get(r.get("ce_sym", ""), r.get("ce_ltp")),
+            "pe_ltp":   ltp_data.get(r.get("pe_sym", ""), r.get("pe_ltp")),
             "ce_iv":    cur_ce_iv,
             "pe_iv":    cur_pe_iv,
             "ce_ema9":  cur_ce_ema9,
