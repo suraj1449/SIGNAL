@@ -42,14 +42,14 @@ from collections import deque
 from flask import Flask, jsonify, render_template_string, request
 from kiteconnect import KiteConnect
 
-API_KEY      = os.environ.get("KITE_API_KEY", "")
-ACCESS_TOKEN = os.environ.get("KITE_ACCESS_TOKEN", "")
+API_KEY      = os.environ.get("KITE_API_KEY") or os.environ.get("API_KEY", "")
+ACCESS_TOKEN = os.environ.get("KITE_ACCESS_TOKEN") or os.environ.get("ACCESS_TOKEN", "")
 
 STRIKE_GAP   = 50
 OTM_DEPTH    = 5        # 11 strikes total
 OI_INTERVAL  = 180      # seconds (3 min)
 LTP_INTERVAL = 1
-RISK_FREE    = 0.10    # 6.5% annualised risk-free rate (Indian T-bill proxy)
+RISK_FREE    = 0.10    # 10% annualised risk-free rate (Indian T-bill proxy)
 
 app  = Flask(__name__)
 kite = KiteConnect(api_key=API_KEY)
@@ -61,9 +61,13 @@ last_oi_time = None
 error_msg    = None
 ltp_symbols  = []
 
-PORT = int(os.environ.get("PORT", "5000"))
-_startup_lock = threading.Lock()
-_startup_done = False
+_prev_oi        = {}
+_instrument_map = {}
+_token_map      = {}
+_sym_to_token   = {}
+_nearest_expiry = None
+_startup_lock   = threading.Lock()
+_startup_done   = False
 
 
 @app.after_request
@@ -72,12 +76,6 @@ def add_no_cache_headers(response):
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
-
-_prev_oi        = {}
-_instrument_map = {}
-_token_map      = {}
-_sym_to_token   = {}
-_nearest_expiry = None
 
 # Live OI snapshots: {strike_int: [{t, ce, pe}, …]}
 oi_history: dict[int, list] = {}
@@ -92,13 +90,13 @@ HIST_OTM_CACHE_KEY   = "otm"
 
 # ── IV storage ────────────────────────────────────────────
 # iv_history[strike] = {"ce": deque([{t, iv}, …]), "pe": deque([{t, iv}, …])}
-# We keep at most 300 raw snapshots per strike
+# Raw snapshots are maintained at 1-minute resolution using live LTP.
 IV_HISTORY_MAXLEN = 300
 iv_history: dict[int, dict] = {}   # populated during fetch_oi
 
 # ── Price + OI history for buildup signals ────────────────
 # price_oi_history[strike] = deque([{t, ce_ltp, pe_ltp, ce_oi, pe_oi}, …])
-# Same cadence as fetch_oi (every OI_INTERVAL seconds)
+# Maintained at 1-minute resolution using live LTP + latest known OI.
 price_oi_history: dict[int, deque] = {}   # populated during fetch_oi
 
 
@@ -206,6 +204,79 @@ def compute_ema(values: list, period: int = 9) -> list:
         else:
             out[i] = round(values[i] * k + out[i - 1] * (1 - k), 2)
     return out
+
+
+def _minute_label(ts: datetime | None = None) -> str:
+    if ts is None:
+        ts = datetime.now()
+    return ts.strftime("%d-%b %H:%M")
+
+
+def _upsert_iv_point(strike: int, side: str, ts_lbl: str, iv_val: float | None):
+    if strike not in iv_history:
+        iv_history[strike] = {
+            "ce": deque(maxlen=IV_HISTORY_MAXLEN),
+            "pe": deque(maxlen=IV_HISTORY_MAXLEN),
+        }
+    buf = iv_history[strike][side]
+    if buf and buf[-1]["t"] == ts_lbl:
+        buf[-1]["iv"] = iv_val
+    else:
+        buf.append({"t": ts_lbl, "iv": iv_val})
+
+
+def _upsert_price_oi_point(strike: int, ts_lbl: str,
+                           ce_ltp: float, pe_ltp: float,
+                           ce_oi: int, pe_oi: int):
+    if strike not in price_oi_history:
+        price_oi_history[strike] = deque(maxlen=IV_HISTORY_MAXLEN)
+    poi_buf = price_oi_history[strike]
+    payload = {
+        "t": ts_lbl,
+        "ce_ltp": ce_ltp,
+        "pe_ltp": pe_ltp,
+        "ce_oi": ce_oi,
+        "pe_oi": pe_oi,
+    }
+    if poi_buf and poi_buf[-1]["t"] == ts_lbl:
+        poi_buf[-1].update(payload)
+    else:
+        poi_buf.append(payload)
+
+
+def update_live_iv_and_buildup_history(ts_lbl: str | None = None, spot: float | None = None):
+    """
+    Keep IV and price+OI history aligned to 1-minute bars using live LTP.
+    OI values are carried forward from the latest OI poll until the next poll.
+    """
+    rows = oi_data.get("rows", [])
+    expiry = _nearest_expiry
+    if not rows or expiry is None:
+        return
+
+    if ts_lbl is None:
+        ts_lbl = _minute_label()
+    if spot is None:
+        spot = ltp_data.get("NSE:NIFTY 50") or oi_data.get("spot")
+    if not spot:
+        return
+
+    T = tte_years(expiry)
+    for r in rows:
+        sk = int(r["strike"])
+        ce_sym = r.get("ce_sym")
+        pe_sym = r.get("pe_sym")
+        ce_ltp = ltp_data.get(ce_sym, r.get("ce_ltp") or 0)
+        pe_ltp = ltp_data.get(pe_sym, r.get("pe_ltp") or 0)
+        ce_oi = int(r.get("ce_oi") or 0)
+        pe_oi = int(r.get("pe_oi") or 0)
+
+        ce_iv = implied_vol(spot, sk, T, RISK_FREE, ce_ltp, "c") if ce_ltp > 0.01 else None
+        pe_iv = implied_vol(spot, sk, T, RISK_FREE, pe_ltp, "p") if pe_ltp > 0.01 else None
+
+        _upsert_iv_point(sk, "ce", ts_lbl, ce_iv)
+        _upsert_iv_point(sk, "pe", ts_lbl, pe_iv)
+        _upsert_price_oi_point(sk, ts_lbl, ce_ltp, pe_ltp, ce_oi, pe_oi)
 
 
 def resample_iv_history(strike: int, side: str, tf_minutes: int) -> list:
@@ -638,34 +709,9 @@ def fetch_oi():
             if not oi_history[sk] or oi_history[sk][-1]["t"] != ts_now:
                 oi_history[sk].append({"t": ts_now, "ce": ce_oi, "pe": pe_oi})
 
-            # ── Compute IV using Black-Scholes ──────────────
+            # ── Compute current IV using Black-Scholes ──────
             ce_iv = implied_vol(spot, sk, T, RISK_FREE, ce_ltp, 'c') if ce_ltp > 0.01 else None
             pe_iv = implied_vol(spot, sk, T, RISK_FREE, pe_ltp, 'p') if pe_ltp > 0.01 else None
-
-            # Store IV history per strike
-            if sk not in iv_history:
-                iv_history[sk] = {
-                    "ce": deque(maxlen=IV_HISTORY_MAXLEN),
-                    "pe": deque(maxlen=IV_HISTORY_MAXLEN),
-                }
-            # Append or update last point if same timestamp
-            for side, iv_val in [("ce", ce_iv), ("pe", pe_iv)]:
-                buf = iv_history[sk][side]
-                if buf and buf[-1]["t"] == ts_now:
-                    buf[-1]["iv"] = iv_val
-                else:
-                    buf.append({"t": ts_now, "iv": iv_val})
-
-            # Store price + OI history for buildup signals
-            if sk not in price_oi_history:
-                price_oi_history[sk] = deque(maxlen=IV_HISTORY_MAXLEN)
-            poi_buf = price_oi_history[sk]
-            if poi_buf and poi_buf[-1]["t"] == ts_now:
-                poi_buf[-1].update({"ce_ltp": ce_ltp, "pe_ltp": pe_ltp,
-                                    "ce_oi": ce_oi, "pe_oi": pe_oi})
-            else:
-                poi_buf.append({"t": ts_now, "ce_ltp": ce_ltp, "pe_ltp": pe_ltp,
-                                "ce_oi": ce_oi, "pe_oi": pe_oi})
 
             result_rows.append({
                 "offset": r["offset"], "strike": r["strike"], "is_atm": r["is_atm"],
@@ -692,6 +738,7 @@ def fetch_oi():
         last_oi_time = datetime.now().strftime("%H:%M:%S")
         error_msg    = None
         ltp_symbols  = ["NSE:NIFTY 50"] + syms
+        update_live_iv_and_buildup_history(ts_lbl=ts_now, spot=spot)
         print(f"  [OI] ATM={atm}  Spot={spot:.2f}  PCR={pcr}  ts={ts_now}")
 
     except Exception as e:
@@ -717,6 +764,7 @@ def fetch_ltp():
         raw = kite.ltp(ltp_symbols)
         ltp_data = {sym: round(v.get("last_price") or 0, 2)
                     for sym, v in raw.items()}
+        update_live_iv_and_buildup_history()
     except Exception:
         pass
 
@@ -832,8 +880,8 @@ def api_iv():
             "offset":   r["offset"],
             "ce_sym":   r.get("ce_sym", ""),   # ← for live LTP update
             "pe_sym":   r.get("pe_sym", ""),
-            "ce_ltp":   r.get("ce_ltp"),
-            "pe_ltp":   r.get("pe_ltp"),
+            "ce_ltp":   ltp_data.get(r.get("ce_sym", ""), r.get("ce_ltp")),
+            "pe_ltp":   ltp_data.get(r.get("pe_sym", ""), r.get("pe_ltp")),
             "ce_iv":    cur_ce_iv,
             "pe_iv":    cur_pe_iv,
             "ce_ema9":  cur_ce_ema9,
@@ -2223,7 +2271,7 @@ function buildIvTable(rows){
 /* Fetch IV data from backend */
 async function fetchIV(){
   try{
-    const res  = await fetch('/api/iv?tf='+ivTf+'&_='+Date.now(), {cache:'no-store'});
+    const res  = await fetch('/api/iv?tf='+ivTf+'&_ts='+Date.now(), {cache:'no-store'});
     const data = await res.json();
     if(data.rows && data.rows.length > 0){
       buildIvTable(data.rows);
@@ -2412,7 +2460,7 @@ async function loadHistoricalOI(strike){
   document.getElementById('chart-ph').style.display='none';
   document.getElementById('oi-chart').style.display='none';
   try{
-    const res=await fetch('/api/historical_oi?strike='+strike+'&_='+Date.now(), {cache:'no-store'});
+    const res=await fetch('/api/historical_oi?strike='+strike);
     const data=await res.json();
     if(data.ts&&data.ts.length>0){
       mergeIntoLocal(strike,data.ts,data.ce,data.pe);
@@ -2428,7 +2476,7 @@ async function loadHistoricalTotal(){
   document.getElementById('chart-ph').style.display='none';
   document.getElementById('oi-chart').style.display='none';
   try{
-    const res=await fetch('/api/historical_oi_total?_='+Date.now(), {cache:'no-store'});const data=await res.json();
+    const res=await fetch('/api/historical_oi_total');const data=await res.json();
     if(data.ts&&data.ts.length>0){
       const combined={};
       const existing=localHistory['TOTAL']||{ts:[],ce:[],pe:[]};
@@ -2448,7 +2496,7 @@ async function loadHistoricalOtm(){
   document.getElementById('chart-ph').style.display='none';
   document.getElementById('oi-chart').style.display='none';
   try{
-    const res=await fetch('/api/historical_oi_otm?_='+Date.now(), {cache:'no-store'});const data=await res.json();
+    const res=await fetch('/api/historical_oi_otm');const data=await res.json();
     if(data.ts&&data.ts.length>0){
       const combined={};
       const existing=localHistory['OTM']||{ts:[],ce:[],pe:[]};
@@ -2506,7 +2554,7 @@ function selectStrike(strike,btnEl){
 ════════════════════════════════════════════════════════════ */
 async function fetchOI(){
   try{
-    const res=await fetch('/api/oi?_='+Date.now(), {cache:'no-store'});const j=await res.json();
+    const res=await fetch('/api/oi?_ts='+Date.now(), {cache:'no-store'});const j=await res.json();
     if(j.error){document.getElementById('err-box').style.display='block';document.getElementById('err-box').textContent='OI Error: '+j.error;return;}
     document.getElementById('err-box').style.display='none';
     const d=j.data;if(!d||!d.atm)return;
@@ -2550,7 +2598,7 @@ async function fetchOI(){
 
 async function fetchLTP(){
   try{
-    const res=await fetch('/api/ltp?_='+Date.now(), {cache:'no-store'});const data=await res.json();
+    const res=await fetch('/api/ltp?_ts='+Date.now(), {cache:'no-store'});const data=await res.json();
     const now=new Date().toLocaleTimeString('en-IN');
     const sv=data['NSE:NIFTY 50'];
     if(sv!==undefined){
@@ -2721,7 +2769,7 @@ async function loadPvData(strike,ceSym,peSym){
   document.getElementById('pv-ce-ph').style.display='none';
   document.getElementById('pv-pe-ph').style.display='none';
   try{
-    const url=`/api/price_vwap?ce_sym=${encodeURIComponent(ceSym)}&pe_sym=${encodeURIComponent(peSym)}&tf=${pvTf}&_=${Date.now()}`;
+    const url=`/api/price_vwap?ce_sym=${encodeURIComponent(ceSym)}&pe_sym=${encodeURIComponent(peSym)}&tf=${pvTf}&_ts=${Date.now()}`;
     const res=await fetch(url, {cache:'no-store'});const data=await res.json();
     if(data.error){
       ['pv-ce-spin','pv-pe-spin'].forEach(id=>document.getElementById(id).classList.remove('show'));
@@ -2762,57 +2810,61 @@ def index():
     return render_template_string(HTML, oi_interval=OI_INTERVAL, ltp_interval=LTP_INTERVAL)
 
 
-@app.route("/healthz")
-def healthz():
-    return jsonify({"status": "ok"})
+@app.before_request
+def ensure_dashboard_started():
+    start_dashboard(blocking_initial_fetch=False)
 
 
-def start_dashboard_runtime():
+def start_dashboard(blocking_initial_fetch: bool = True):
     global _startup_done
     with _startup_lock:
         if _startup_done:
             return
-        print("="*70)
+
+        print("=" * 70)
         print("  NIFTY OI Dashboard  v7  (Long Buildup + Short Covering + LTP fix)")
         print(f"  OI refresh : {OI_INTERVAL}s   LTP refresh : {LTP_INTERVAL}s")
-        print(f"  Strikes    : ATM±{OTM_DEPTH}  ({2*OTM_DEPTH+1} rows total)")
-        print(f"  IV Method  : Black-Scholes Newton-Raphson (pure Python)")
-        print(f"  Risk-Free  : {RISK_FREE*100:.1f}%  |  EMA Period: 9")
-        print(f"  IV TF opts : 1 / 3 / 5 / 10 min")
-        print(f"  Buildup    : Price ±5% & OI ±5% threshold (per TF bar)")
-        print("="*70)
+        print(f"  Strikes    : ATM±{OTM_DEPTH}  ({2 * OTM_DEPTH + 1} rows total)")
+        print("  IV Method  : Black-Scholes Newton-Raphson (pure Python)")
+        print(f"  Risk-Free  : {RISK_FREE * 100:.1f}%  |  EMA Period: 9")
+        print("  IV TF opts : 1 / 3 / 5 / 10 min")
+        print("  Buildup    : Price ±5% & OI ±5% threshold (per TF bar)")
+        print("=" * 70)
+        if not API_KEY or not ACCESS_TOKEN:
+            print("  ⚠  Kite credentials missing. Set KITE_API_KEY and KITE_ACCESS_TOKEN.")
         print("  → Fetching instruments + initial OI …")
-        fetch_oi()
-        fetch_ltp()
-        if error_msg:
-            print(f"\n  ⚠  ERROR: {error_msg}\n")
-        else:
-            print(f"\n  ✓  Expiry   = {oi_data.get('expiry')}")
-            print(f"  ✓  ATM      = {oi_data.get('atm')}")
-            print(f"  ✓  Symbols  = {len(ltp_symbols)} tracked")
-            print(f"  ✓  Tokens   = {len(_token_map)} loaded for historical")
-            print(f"  ✓  IV rows  = {len(iv_history)} strikes computed")
-            for sk, sides in list(iv_history.items())[:3]:
-                ce_iv = sides['ce'][-1]['iv'] if sides['ce'] else None
-                pe_iv = sides['pe'][-1]['iv'] if sides['pe'] else None
-                print(f"     Strike {sk}:  CE IV={ce_iv}%  PE IV={pe_iv}%")
         threading.Thread(target=oi_loop, daemon=True, name="OI-Thread").start()
         threading.Thread(target=ltp_loop, daemon=True, name="LTP-Thread").start()
-        print(f"\n  ▶  App ready on port {PORT}\n")
+
+        def do_initial_fetch():
+            fetch_oi()
+            if error_msg:
+                print(f"\n  ⚠  ERROR: {error_msg}\n")
+            else:
+                print(f"\n  ✓  Expiry   = {oi_data.get('expiry')}")
+                print(f"  ✓  ATM      = {oi_data.get('atm')}")
+                print(f"  ✓  Symbols  = {len(ltp_symbols)} tracked")
+                print(f"  ✓  Tokens   = {len(_token_map)} loaded for historical")
+                print(f"  ✓  IV rows  = {len(iv_history)} strikes computed")
+                # Print a sample of first-run IVs
+                for sk, sides in list(iv_history.items())[:3]:
+                    ce_iv = sides["ce"][-1]["iv"] if sides["ce"] else None
+                    pe_iv = sides["pe"][-1]["iv"] if sides["pe"] else None
+                    print(f"     Strike {sk}:  CE IV={ce_iv}%  PE IV={pe_iv}%")
+
+        if blocking_initial_fetch:
+            do_initial_fetch()
+        else:
+            threading.Thread(target=do_initial_fetch, daemon=True, name="OI-Init-Thread").start()
+
         _startup_done = True
-
-
-@app.before_request
-def ensure_runtime_started():
-    if not _startup_done:
-        start_dashboard_runtime()
 
 
 # ═══════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    start_dashboard_runtime()
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
-else:
-    start_dashboard_runtime()
+    start_dashboard(blocking_initial_fetch=True)
+    port = int(os.environ.get("PORT", "5000"))
+    print(f"\n  ▶  Open browser →  http://localhost:{port}\n")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
