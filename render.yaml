@@ -1,10 +1,14 @@
 services:
   - type: web
-    name: nifty-oi-dashboard
+    name: dss-render
     env: python
+    plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120 DSS:app
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
+    healthCheckPath: /healthz
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: KITE_API_KEY
         sync: false
       - key: KITE_ACCESS_TOKEN
