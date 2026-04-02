@@ -69,6 +69,14 @@ _nearest_expiry = None
 _startup_lock   = threading.Lock()
 _startup_done   = False
 
+
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 # Live OI snapshots: {strike_int: [{t, ce, pe}, …]}
 oi_history: dict[int, list] = {}
 
@@ -2213,7 +2221,7 @@ function buildIvTable(rows){
 /* Fetch IV data from backend */
 async function fetchIV(){
   try{
-    const res  = await fetch('/api/iv?tf='+ivTf);
+    const res  = await fetch('/api/iv?tf='+ivTf+'&_ts='+Date.now(), {cache:'no-store'});
     const data = await res.json();
     if(data.rows && data.rows.length > 0){
       buildIvTable(data.rows);
@@ -2496,7 +2504,7 @@ function selectStrike(strike,btnEl){
 ════════════════════════════════════════════════════════════ */
 async function fetchOI(){
   try{
-    const res=await fetch('/api/oi');const j=await res.json();
+    const res=await fetch('/api/oi?_ts='+Date.now(), {cache:'no-store'});const j=await res.json();
     if(j.error){document.getElementById('err-box').style.display='block';document.getElementById('err-box').textContent='OI Error: '+j.error;return;}
     document.getElementById('err-box').style.display='none';
     const d=j.data;if(!d||!d.atm)return;
@@ -2540,7 +2548,7 @@ async function fetchOI(){
 
 async function fetchLTP(){
   try{
-    const res=await fetch('/api/ltp');const data=await res.json();
+    const res=await fetch('/api/ltp?_ts='+Date.now(), {cache:'no-store'});const data=await res.json();
     const now=new Date().toLocaleTimeString('en-IN');
     const sv=data['NSE:NIFTY 50'];
     if(sv!==undefined){
@@ -2711,8 +2719,8 @@ async function loadPvData(strike,ceSym,peSym){
   document.getElementById('pv-ce-ph').style.display='none';
   document.getElementById('pv-pe-ph').style.display='none';
   try{
-    const url=`/api/price_vwap?ce_sym=${encodeURIComponent(ceSym)}&pe_sym=${encodeURIComponent(peSym)}&tf=${pvTf}`;
-    const res=await fetch(url);const data=await res.json();
+    const url=`/api/price_vwap?ce_sym=${encodeURIComponent(ceSym)}&pe_sym=${encodeURIComponent(peSym)}&tf=${pvTf}&_ts=${Date.now()}`;
+    const res=await fetch(url, {cache:'no-store'});const data=await res.json();
     if(data.error){
       ['pv-ce-spin','pv-pe-spin'].forEach(id=>document.getElementById(id).classList.remove('show'));
       ['pv-ce-ph','pv-pe-ph'].forEach(id=>{const el=document.getElementById(id);el.style.display='flex';const p=el.querySelector('p');if(p)p.innerHTML=`<span style="font-size:.6rem;color:var(--err-cl)">${data.error}</span>`;});
