@@ -1,3 +1,41 @@
+"""
+NIFTY OI Dashboard  v7  —  Long Buildup / Short Covering Signals + LTP fix
+═══════════════════════════════════════════════════════════════════════════
+NEW IN v7:
+  ① Long Buildup / Short Covering signals in the IV table:
+      Each row now shows a "Buildup" column for CE and PE independently.
+
+      Signal logic (compares current bar vs N-bars-ago, where N = TF):
+        Price % Change   OI % Change   Signal
+        ────────────────────────────────────────────────────────
+        ≥ +5%            ≥ +5%         Long Build-up   ✅  Strong Buy
+        ≥ +5%            ≤ -5%         Short Covering  🔥🔥 Very Strong Buy
+        ≤ -5%            ≥ +5%         Short Build-up  🔻  Bearish
+        ≤ -5%            ≤ -5%         Long Unwinding  ⚠️   Caution
+        Other                          Neutral          —
+
+      "Price" = option LTP (CE or PE separately)
+      "OI"    = option OI (CE or PE separately)
+      Both are compared over the selected timeframe window (1/3/5/10 min).
+
+  ② Live LTP fix in IV table:
+      - IV table LTP cells get a unique `id` per strike (`iv-ce-ltp-{strike}`)
+      - The existing 1-second LTP loop now also updates these cells
+      - LTP is no longer stale between OI polls
+
+  ③ Price+OI history stored alongside IV:
+      - `price_oi_history[strike]` = deque of {t, ce_ltp, pe_ltp, ce_oi, pe_oi}
+      - `resample_price_oi()` resamples to TF and computes % changes for signal
+
+RETAINED FROM v6:
+  - Black-Scholes IV + EMA(9) signal
+  - 4-day OI history chart (3 historical + today live)
+  - All existing OI table, PCR bar, stat cards, Price/VWAP charts
+
+DEPENDENCIES:  pip install flask kiteconnect
+═══════════════════════════════════════════════════════════════════════════
+"""
+
 import math, os, time, threading
 from datetime import datetime, date, timedelta
 from collections import deque
@@ -26,6 +64,14 @@ ltp_symbols  = []
 PORT = int(os.environ.get("PORT", "5000"))
 _startup_lock = threading.Lock()
 _startup_done = False
+
+
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 _prev_oi        = {}
 _instrument_map = {}
@@ -2177,7 +2223,7 @@ function buildIvTable(rows){
 /* Fetch IV data from backend */
 async function fetchIV(){
   try{
-    const res  = await fetch('/api/iv?tf='+ivTf);
+    const res  = await fetch('/api/iv?tf='+ivTf+'&_='+Date.now(), {cache:'no-store'});
     const data = await res.json();
     if(data.rows && data.rows.length > 0){
       buildIvTable(data.rows);
@@ -2366,7 +2412,7 @@ async function loadHistoricalOI(strike){
   document.getElementById('chart-ph').style.display='none';
   document.getElementById('oi-chart').style.display='none';
   try{
-    const res=await fetch('/api/historical_oi?strike='+strike);
+    const res=await fetch('/api/historical_oi?strike='+strike+'&_='+Date.now(), {cache:'no-store'});
     const data=await res.json();
     if(data.ts&&data.ts.length>0){
       mergeIntoLocal(strike,data.ts,data.ce,data.pe);
@@ -2382,7 +2428,7 @@ async function loadHistoricalTotal(){
   document.getElementById('chart-ph').style.display='none';
   document.getElementById('oi-chart').style.display='none';
   try{
-    const res=await fetch('/api/historical_oi_total');const data=await res.json();
+    const res=await fetch('/api/historical_oi_total?_='+Date.now(), {cache:'no-store'});const data=await res.json();
     if(data.ts&&data.ts.length>0){
       const combined={};
       const existing=localHistory['TOTAL']||{ts:[],ce:[],pe:[]};
@@ -2402,7 +2448,7 @@ async function loadHistoricalOtm(){
   document.getElementById('chart-ph').style.display='none';
   document.getElementById('oi-chart').style.display='none';
   try{
-    const res=await fetch('/api/historical_oi_otm');const data=await res.json();
+    const res=await fetch('/api/historical_oi_otm?_='+Date.now(), {cache:'no-store'});const data=await res.json();
     if(data.ts&&data.ts.length>0){
       const combined={};
       const existing=localHistory['OTM']||{ts:[],ce:[],pe:[]};
@@ -2460,7 +2506,7 @@ function selectStrike(strike,btnEl){
 ════════════════════════════════════════════════════════════ */
 async function fetchOI(){
   try{
-    const res=await fetch('/api/oi');const j=await res.json();
+    const res=await fetch('/api/oi?_='+Date.now(), {cache:'no-store'});const j=await res.json();
     if(j.error){document.getElementById('err-box').style.display='block';document.getElementById('err-box').textContent='OI Error: '+j.error;return;}
     document.getElementById('err-box').style.display='none';
     const d=j.data;if(!d||!d.atm)return;
@@ -2504,7 +2550,7 @@ async function fetchOI(){
 
 async function fetchLTP(){
   try{
-    const res=await fetch('/api/ltp');const data=await res.json();
+    const res=await fetch('/api/ltp?_='+Date.now(), {cache:'no-store'});const data=await res.json();
     const now=new Date().toLocaleTimeString('en-IN');
     const sv=data['NSE:NIFTY 50'];
     if(sv!==undefined){
@@ -2675,8 +2721,8 @@ async function loadPvData(strike,ceSym,peSym){
   document.getElementById('pv-ce-ph').style.display='none';
   document.getElementById('pv-pe-ph').style.display='none';
   try{
-    const url=`/api/price_vwap?ce_sym=${encodeURIComponent(ceSym)}&pe_sym=${encodeURIComponent(peSym)}&tf=${pvTf}`;
-    const res=await fetch(url);const data=await res.json();
+    const url=`/api/price_vwap?ce_sym=${encodeURIComponent(ceSym)}&pe_sym=${encodeURIComponent(peSym)}&tf=${pvTf}&_=${Date.now()}`;
+    const res=await fetch(url, {cache:'no-store'});const data=await res.json();
     if(data.error){
       ['pv-ce-spin','pv-pe-spin'].forEach(id=>document.getElementById(id).classList.remove('show'));
       ['pv-ce-ph','pv-pe-ph'].forEach(id=>{const el=document.getElementById(id);el.style.display='flex';const p=el.querySelector('p');if(p)p.innerHTML=`<span style="font-size:.6rem;color:var(--err-cl)">${data.error}</span>`;});
@@ -2737,6 +2783,7 @@ def start_dashboard_runtime():
         print("="*70)
         print("  → Fetching instruments + initial OI …")
         fetch_oi()
+        fetch_ltp()
         if error_msg:
             print(f"\n  ⚠  ERROR: {error_msg}\n")
         else:
@@ -2753,6 +2800,12 @@ def start_dashboard_runtime():
         threading.Thread(target=ltp_loop, daemon=True, name="LTP-Thread").start()
         print(f"\n  ▶  App ready on port {PORT}\n")
         _startup_done = True
+
+
+@app.before_request
+def ensure_runtime_started():
+    if not _startup_done:
+        start_dashboard_runtime()
 
 
 # ═══════════════════════════════════════════════════════════
