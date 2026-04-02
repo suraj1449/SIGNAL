@@ -2760,7 +2760,12 @@ def index():
     return render_template_string(HTML, oi_interval=OI_INTERVAL, ltp_interval=LTP_INTERVAL)
 
 
-def start_dashboard():
+@app.before_request
+def ensure_dashboard_started():
+    start_dashboard(blocking_initial_fetch=False)
+
+
+def start_dashboard(blocking_initial_fetch: bool = True):
     global _startup_done
     with _startup_lock:
         if _startup_done:
@@ -2778,24 +2783,30 @@ def start_dashboard():
         if not API_KEY or not ACCESS_TOKEN:
             print("  ⚠  Kite credentials missing. Set KITE_API_KEY and KITE_ACCESS_TOKEN.")
         print("  → Fetching instruments + initial OI …")
-
-        fetch_oi()
-        if error_msg:
-            print(f"\n  ⚠  ERROR: {error_msg}\n")
-        else:
-            print(f"\n  ✓  Expiry   = {oi_data.get('expiry')}")
-            print(f"  ✓  ATM      = {oi_data.get('atm')}")
-            print(f"  ✓  Symbols  = {len(ltp_symbols)} tracked")
-            print(f"  ✓  Tokens   = {len(_token_map)} loaded for historical")
-            print(f"  ✓  IV rows  = {len(iv_history)} strikes computed")
-            # Print a sample of first-run IVs
-            for sk, sides in list(iv_history.items())[:3]:
-                ce_iv = sides["ce"][-1]["iv"] if sides["ce"] else None
-                pe_iv = sides["pe"][-1]["iv"] if sides["pe"] else None
-                print(f"     Strike {sk}:  CE IV={ce_iv}%  PE IV={pe_iv}%")
-
         threading.Thread(target=oi_loop, daemon=True, name="OI-Thread").start()
         threading.Thread(target=ltp_loop, daemon=True, name="LTP-Thread").start()
+
+        def do_initial_fetch():
+            fetch_oi()
+            if error_msg:
+                print(f"\n  ⚠  ERROR: {error_msg}\n")
+            else:
+                print(f"\n  ✓  Expiry   = {oi_data.get('expiry')}")
+                print(f"  ✓  ATM      = {oi_data.get('atm')}")
+                print(f"  ✓  Symbols  = {len(ltp_symbols)} tracked")
+                print(f"  ✓  Tokens   = {len(_token_map)} loaded for historical")
+                print(f"  ✓  IV rows  = {len(iv_history)} strikes computed")
+                # Print a sample of first-run IVs
+                for sk, sides in list(iv_history.items())[:3]:
+                    ce_iv = sides["ce"][-1]["iv"] if sides["ce"] else None
+                    pe_iv = sides["pe"][-1]["iv"] if sides["pe"] else None
+                    print(f"     Strike {sk}:  CE IV={ce_iv}%  PE IV={pe_iv}%")
+
+        if blocking_initial_fetch:
+            do_initial_fetch()
+        else:
+            threading.Thread(target=do_initial_fetch, daemon=True, name="OI-Init-Thread").start()
+
         _startup_done = True
 
 
@@ -2803,9 +2814,7 @@ def start_dashboard():
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    start_dashboard()
+    start_dashboard(blocking_initial_fetch=True)
     port = int(os.environ.get("PORT", "5000"))
     print(f"\n  ▶  Open browser →  http://localhost:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
-else:
-    start_dashboard()
