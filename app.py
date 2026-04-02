@@ -455,10 +455,10 @@ def _fetch_historical_for_strike(strike: int) -> dict:
     pe_raw = kite.historical_data(pe_tok, from_dt, to_dt, "3minute", oi=True)
     ts_map: dict[str, dict] = {}
     for c in ce_raw:
-        lbl = c["date"].strftime("%d-%b %H:%M")
+        lbl = c["date"].strftime("%Y-%m-%d %H:%M")
         ts_map.setdefault(lbl, {})["ce"] = c.get("oi", 0)
     for c in pe_raw:
-        lbl = c["date"].strftime("%d-%b %H:%M")
+        lbl = c["date"].strftime("%Y-%m-%d %H:%M")
         ts_map.setdefault(lbl, {})["pe"] = c.get("oi", 0)
     sorted_ts = sorted(ts_map.keys())
     return {"ts": sorted_ts,
@@ -487,12 +487,15 @@ def _fetch_historical_total() -> dict:
         except Exception as e:
             print(f"  [HIST-TOTAL] Failed for strike {strike}: {e}"); continue
         for c in ce_raw:
-            lbl = c["date"].strftime("%d-%b %H:%M")
+            lbl = c["date"].strftime("%Y-%m-%d %H:%M")
             ts_ce[lbl] = ts_ce.get(lbl, 0) + (c.get("oi") or 0)
         for c in pe_raw:
-            lbl = c["date"].strftime("%d-%b %H:%M")
+            lbl = c["date"].strftime("%Y-%m-%d %H:%M")
             ts_pe[lbl] = ts_pe.get(lbl, 0) + (c.get("oi") or 0)
-    all_ts = sorted(set(ts_ce) | set(ts_pe))
+        all_ts = sorted(
+        set(ts_ce) | set(ts_pe),
+        key=lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M")
+        )
     return {"ts": all_ts,
             "ce": [ts_ce.get(t, 0) for t in all_ts],
             "pe": [ts_pe.get(t, 0) for t in all_ts]}
@@ -522,13 +525,16 @@ def _fetch_historical_otm() -> dict:
             print(f"  [HIST-OTM] Failed for strike {strike}: {e}"); continue
         if offset > 0:
             for c in ce_raw:
-                lbl = c["date"].strftime("%d-%b %H:%M")
+                lbl = c["date"].strftime("%Y-%m-%d %H:%M")
                 ts_ce[lbl] = ts_ce.get(lbl, 0) + (c.get("oi") or 0)
         if offset < 0:
             for c in pe_raw:
-                lbl = c["date"].strftime("%d-%b %H:%M")
+                lbl = c["date"].strftime("%Y-%m-%d %H:%M")
                 ts_pe[lbl] = ts_pe.get(lbl, 0) + (c.get("oi") or 0)
-    all_ts = sorted(set(ts_ce) | set(ts_pe))
+        all_ts = sorted(
+        set(ts_ce) | set(ts_pe),
+        key=lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M")
+        )
     return {"ts": all_ts,
             "ce": [ts_ce.get(t, 0) for t in all_ts],
             "pe": [ts_pe.get(t, 0) for t in all_ts]}
@@ -546,7 +552,10 @@ def _merge_hist_total_with_live(hist: dict) -> dict:
             live_ts[t]["pe"] += pt["pe"]
     for t, v in live_ts.items():
         ts_map[t] = v
-    sorted_ts = sorted(ts_map.keys())
+    sorted_ts = sorted(
+    ts_map.keys(),
+    key=lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M")
+    )
     return {"ts": sorted_ts,
             "ce": [ts_map[t]["ce"] for t in sorted_ts],
             "pe": [ts_map[t]["pe"] for t in sorted_ts]}
@@ -556,7 +565,10 @@ def _merge_hist_with_live(strike: int, hist: dict) -> dict:
     ts_map = {t: {"ce": hist["ce"][i], "pe": hist["pe"][i]} for i, t in enumerate(hist["ts"])}
     for pt in oi_history.get(strike, []):
         ts_map[pt["t"]] = {"ce": pt["ce"], "pe": pt["pe"]}
-    sorted_ts = sorted(ts_map.keys())
+    sorted_ts = sorted(
+    ts_map.keys(),
+    key=lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M")
+    )
     return {"ts": sorted_ts,
             "ce": [ts_map[t]["ce"] for t in sorted_ts],
             "pe": [ts_map[t]["pe"] for t in sorted_ts]}
@@ -579,7 +591,10 @@ def _merge_hist_otm_with_live(hist: dict) -> dict:
                 live_ts[t]["pe"] += pt["pe"]
     for t, v in live_ts.items():
         ts_map[t] = v
-    sorted_ts = sorted(ts_map.keys())
+    sorted_ts = sorted(
+    ts_map.keys(),
+    key=lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M")
+    )
     return {"ts": sorted_ts,
             "ce": [ts_map[t]["ce"] for t in sorted_ts],
             "pe": [ts_map[t]["pe"] for t in sorted_ts]}
@@ -611,7 +626,7 @@ def fetch_oi():
         new_snap = {}
         result_rows = []
         total_ce = total_pe = 0
-        ts_now = datetime.now().strftime("%d-%b %H:%M")
+        ts_now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         for r in rows:
             ceq = quotes.get(r["ce_sym"], {})
