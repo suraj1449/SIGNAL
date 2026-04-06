@@ -206,79 +206,6 @@ def compute_ema(values: list, period: int = 9) -> list:
     return out
 
 
-def _minute_label(ts: datetime | None = None) -> str:
-    if ts is None:
-        ts = datetime.now()
-    return ts.strftime("%d-%b %H:%M")
-
-
-def _upsert_iv_point(strike: int, side: str, ts_lbl: str, iv_val: float | None):
-    if strike not in iv_history:
-        iv_history[strike] = {
-            "ce": deque(maxlen=IV_HISTORY_MAXLEN),
-            "pe": deque(maxlen=IV_HISTORY_MAXLEN),
-        }
-    buf = iv_history[strike][side]
-    if buf and buf[-1]["t"] == ts_lbl:
-        buf[-1]["iv"] = iv_val
-    else:
-        buf.append({"t": ts_lbl, "iv": iv_val})
-
-
-def _upsert_price_oi_point(strike: int, ts_lbl: str,
-                           ce_ltp: float, pe_ltp: float,
-                           ce_oi: int, pe_oi: int):
-    if strike not in price_oi_history:
-        price_oi_history[strike] = deque(maxlen=IV_HISTORY_MAXLEN)
-    poi_buf = price_oi_history[strike]
-    payload = {
-        "t": ts_lbl,
-        "ce_ltp": ce_ltp,
-        "pe_ltp": pe_ltp,
-        "ce_oi": ce_oi,
-        "pe_oi": pe_oi,
-    }
-    if poi_buf and poi_buf[-1]["t"] == ts_lbl:
-        poi_buf[-1].update(payload)
-    else:
-        poi_buf.append(payload)
-
-
-def update_live_iv_and_buildup_history(ts_lbl: str | None = None, spot: float | None = None):
-    """
-    Keep IV and price+OI history aligned to 1-minute bars using live LTP.
-    OI values are carried forward from the latest OI poll until the next poll.
-    """
-    rows = oi_data.get("rows", [])
-    expiry = _nearest_expiry
-    if not rows or expiry is None:
-        return
-
-    if ts_lbl is None:
-        ts_lbl = _minute_label()
-    if spot is None:
-        spot = ltp_data.get("NSE:NIFTY 50") or oi_data.get("spot")
-    if not spot:
-        return
-
-    T = tte_years(expiry)
-    for r in rows:
-        sk = int(r["strike"])
-        ce_sym = r.get("ce_sym")
-        pe_sym = r.get("pe_sym")
-        ce_ltp = ltp_data.get(ce_sym, r.get("ce_ltp") or 0)
-        pe_ltp = ltp_data.get(pe_sym, r.get("pe_ltp") or 0)
-        ce_oi = int(r.get("ce_oi") or 0)
-        pe_oi = int(r.get("pe_oi") or 0)
-
-        ce_iv = implied_vol(spot, sk, T, RISK_FREE, ce_ltp, "c") if ce_ltp > 0.01 else None
-        pe_iv = implied_vol(spot, sk, T, RISK_FREE, pe_ltp, "p") if pe_ltp > 0.01 else None
-
-        _upsert_iv_point(sk, "ce", ts_lbl, ce_iv)
-        _upsert_iv_point(sk, "pe", ts_lbl, pe_iv)
-        _upsert_price_oi_point(sk, ts_lbl, ce_ltp, pe_ltp, ce_oi, pe_oi)
-
-
 def resample_iv_history(strike: int, side: str, tf_minutes: int) -> list:
     """
     Resample raw IV snapshots (1-min cadence) into `tf_minutes` bars.
@@ -713,6 +640,31 @@ def fetch_oi():
             ce_iv = implied_vol(spot, sk, T, RISK_FREE, ce_ltp, 'c') if ce_ltp > 0.01 else None
             pe_iv = implied_vol(spot, sk, T, RISK_FREE, pe_ltp, 'p') if pe_ltp > 0.01 else None
 
+            # Store IV history per strike
+            if sk not in iv_history:
+                iv_history[sk] = {
+                    "ce": deque(maxlen=IV_HISTORY_MAXLEN),
+                    "pe": deque(maxlen=IV_HISTORY_MAXLEN),
+                }
+            # Append or update last point if same timestamp
+            for side, iv_val in [("ce", ce_iv), ("pe", pe_iv)]:
+                buf = iv_history[sk][side]
+                if buf and buf[-1]["t"] == ts_now:
+                    buf[-1]["iv"] = iv_val
+                else:
+                    buf.append({"t": ts_now, "iv": iv_val})
+
+            # Store price + OI history for buildup signals
+            if sk not in price_oi_history:
+                price_oi_history[sk] = deque(maxlen=IV_HISTORY_MAXLEN)
+            poi_buf = price_oi_history[sk]
+            if poi_buf and poi_buf[-1]["t"] == ts_now:
+                poi_buf[-1].update({"ce_ltp": ce_ltp, "pe_ltp": pe_ltp,
+                                    "ce_oi": ce_oi, "pe_oi": pe_oi})
+            else:
+                poi_buf.append({"t": ts_now, "ce_ltp": ce_ltp, "pe_ltp": pe_ltp,
+                                "ce_oi": ce_oi, "pe_oi": pe_oi})
+
             result_rows.append({
                 "offset": r["offset"], "strike": r["strike"], "is_atm": r["is_atm"],
                 "ce_sym": r["ce_sym"], "pe_sym": r["pe_sym"],
@@ -738,7 +690,6 @@ def fetch_oi():
         last_oi_time = datetime.now().strftime("%H:%M:%S")
         error_msg    = None
         ltp_symbols  = ["NSE:NIFTY 50"] + syms
-        update_live_iv_and_buildup_history(ts_lbl=ts_now, spot=spot)
         print(f"  [OI] ATM={atm}  Spot={spot:.2f}  PCR={pcr}  ts={ts_now}")
 
     except Exception as e:
@@ -764,7 +715,6 @@ def fetch_ltp():
         raw = kite.ltp(ltp_symbols)
         ltp_data = {sym: round(v.get("last_price") or 0, 2)
                     for sym, v in raw.items()}
-        update_live_iv_and_buildup_history()
     except Exception:
         pass
 
@@ -2853,7 +2803,7 @@ def start_dashboard(blocking_initial_fetch: bool = True):
                     print(f"     Strike {sk}:  CE IV={ce_iv}%  PE IV={pe_iv}%")
 
         if blocking_initial_fetch:
-            do_initial_fetch()
+            do_initial_fetch()  
         else:
             threading.Thread(target=do_initial_fetch, daemon=True, name="OI-Init-Thread").start()
 
